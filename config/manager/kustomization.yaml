@@ -5,4 +5,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: sjhong1994/lb-linker-operator
-  newTag: v0.2
+  newTag: v0.4

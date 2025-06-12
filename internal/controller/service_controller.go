@@ -66,6 +66,9 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		log.Error(err, "Failed to get Original Service")
 		return ctrl.Result{}, err
 	}
+	// ExternalName Service 이름 결정(LB이름 + Namespace + ext) 예) my-sample-lb-3-default-ext
+	externalNameServiceName := fmt.Sprintf("%s-%s-ext", originalService.Name, originalService.Namespace)
+	externalNameServiceName = r.sanitizeName(externalNameServiceName)
 
 	// 2. Service가 LoadBalancer 타입인지 확인
 	if originalService.Spec.Type != corev1.ServiceTypeLoadBalancer {
@@ -79,34 +82,46 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if controllerutil.ContainsFinalizer(&originalService, lbLinkerFinalizer) {
 			log.Info("LoadBalancer Service is being deleted, starting cleanup logic.")
 			// Target정리가 필요한 ExternalName은 LB의 이름규칙을 기반으로 확인하기 위해 변수 설정
-			externalNameServiceName := fmt.Sprintf("%s-%s-ext", originalService.Name, originalService.Namespace)
-			externalNameServiceName = r.sanitizeName(externalNameServiceName)
 
 			// Target을 정리할 ExternalName을 가져온다.
-			var externalNameSvcToClear corev1.Service
-			err := r.Get(ctx, types.NamespacedName{Name: externalNameServiceName, Namespace: externalTargetsNamespace}, &externalNameSvcToClear)
-			if err != nil {
-				if apierrors.IsNotFound(err) {
-					// 정리할 ExternalName이 없다면 곧바로 Finalizer를 제거해도 되니 Log출력
-					log.Info("Associated ExternalName SErvice Not found, nothing to clenup. delete finalizer")
-				} else {
-					// 기타오류의 경우 Reconcile 재시도
-					log.Error(err, "Failed to get ExternalName Service for cleanup")
-					return ctrl.Result{}, err
-				}
-			} else {
-				// Externalname이 있는 경우, spec.externName 필드를 공백으로 변경
-				log.Info("Found associated ExternalName Service, clearint its target.", "target", externalNameSvcToClear.Name)
-				beforePatch := externalNameSvcToClear.DeepCopy()
-				externalNameSvcToClear.Spec.ExternalName = "" // Target 공백 설정
-
-				// Patch를 사용하여 변경내용 적용
-				if err := r.Patch(ctx, &externalNameSvcToClear, client.MergeFrom(beforePatch)); err != nil {
-					log.Error(err, "Failed to patch ExternalName Service to clear target")
-					return ctrl.Result{}, err
-				}
-				log.Info("Successfully cleared ExternalName target.")
+			svcToDelete := &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      externalNameServiceName,
+					Namespace: externalTargetsNamespace,
+				},
 			}
+
+			log.Info("Attempting to delete associated ExternalName Service", "name", svcToDelete)
+			// ExternalName 리소스 삭제 작업
+			if err := r.Delete(ctx, svcToDelete); err != nil {
+				// 어차피 삭제되어야할 리소스는 Notfound여야 하니 예외
+				// Notfound가 아닌 에러의 경우만 에러로 간주하여 출력
+				if !apierrors.IsNotFound(err) {
+					log.Error(err, "Failed to delete Externalname Service")
+					return ctrl.Result{}, err
+				}
+				log.Info("ExternalName Service was aleady deleted.")
+
+			}
+
+			// ExternalName Target제거 작업이 성공하면 LoadBalancer에서 finalizer 제거
+			controllerutil.RemoveFinalizer(&originalService, lbLinkerFinalizer)
+			if err := r.Update(ctx, &originalService); err != nil {
+				log.Error(err, "Failed to remove finalizer")
+				return ctrl.Result{}, err
+			}
+			log.Info("Cleanup finished, removing finalizer.")
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// 3a. Service가 삭제중이 아닐 때: Finalizer가 없다면 추가
+	if !controllerutil.ContainsFinalizer(&originalService, lbLinkerFinalizer) {
+		log.Info("Adding Finalizer for the Loadbalacner Service.")
+		controllerutil.AddFinalizer(&originalService, lbLinkerFinalizer)
+		if err := r.Update(ctx, &originalService); err != nil {
+			log.Error(err, "Failed to add finalizer")
+			return ctrl.Result{}, err
 		}
 	}
 
@@ -128,18 +143,14 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	log.Info("Found external target for Original Service", "target", externalTarget)
 
-	// 5. ExternalName Service 이름 결정(LB이름 + Namespace + ext) 예) my-sample-lb-3-default-ext
-	externalNameServiceName := fmt.Sprintf("%s-%s-ext", originalService.Name, originalService.Namespace)
-	externalNameServiceName = r.sanitizeName(externalNameServiceName) // 이름 규칙에 맞게 정제
-
-	// 6. 기존 ExternalName Service 가져오기 시도
+	// 5. 기존 ExternalName Service 가져오기 시도
 	foundExternalNameSvc := &corev1.Service{}
 	externalNameSvcKey := types.NamespacedName{Name: externalNameServiceName, Namespace: externalTargetsNamespace}
 
 	err := r.Get(ctx, externalNameSvcKey, foundExternalNameSvc)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			// 6a. ExternalName Service가 없음: 새로 생성
+			// 5a. ExternalName Service가 없음: 새로 생성
 			log.Info("ExternalName Service not found. Creating a new one.", "targetNamespace", externalTargetsNamespace, "targetName", externalNameServiceName)
 			newExternalNameSvc := &corev1.Service{
 				ObjectMeta: metav1.ObjectMeta{
@@ -169,7 +180,7 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
-	// 6b. ExternalName Service가 이미 존재함: spec.externalName 필드 업데이트 확인
+	// 5b. ExternalName Service가 이미 존재함: spec.externalName 필드 업데이트 확인
 	if foundExternalNameSvc.Spec.ExternalName != externalTarget {
 		log.Info("Existing ExternalName Service needs update.", "oldTarget", foundExternalNameSvc.Spec.ExternalName, "newTarget", externalTarget)
 

@@ -27,8 +27,10 @@ import (
 //+kubebuilder:rbac:groups=core,resources=services,verbs=create;update;patch;delete;get;list;watch
 
 const (
-	externalTargetsNamespace = "external-targets" // ExternalName 서비스를 생성/관리할 네임스페이스 (미리 생성 필요)
-	lbLinkerFinalizer        = "lb-linker/finalizer"
+	externalTargetsNamespace = "external-targets"       // ExternalName 서비스를 생성/관리할 네임스페이스 (미리 생성 필요)
+	lbLinkerFinalizer        = "lb-linker/finalizer"    // Filnalizer 변수 값 추가
+	managedAnnotationKey     = "linker.hsj.com/managed" // Annotaion Key 추가 변수
+	managedAnnotationValue   = "true"                   // Annotaion Key에 대한 Value 변수 추가
 )
 
 // ServiceReconciler reconciles a Service object
@@ -53,6 +55,48 @@ func (r *ServiceReconciler) sanitizeName(name string) string {
 	return name
 }
 
+// Loadbalancer가 삭제될때 이와 연결된 ExternalName도 삭제하는 함수 추가
+func (r *ServiceReconciler) cleanupExternalNameService(ctx context.Context, originalservice *corev1.Service, log logr.Logger) error {
+	log.Info("Starting cleanup for associated ExternalName Service...")
+
+	// 1. 이름규칙을 기반으로 삭제할 ExternalName 서비스의 이름을 결정
+	externalNameServiceName := fmt.Sprintf("%s-%s-ext", originalservice.Name, originalservice.Namespace)
+	externalNameServiceName = r.sanitizeName(externalNameServiceName)
+
+	// 2. 삭제할 ExternalName을 정의
+	svcToDelete := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      externalNameServiceName,
+			Namespace: externalTargetsNamespace,
+		},
+	}
+
+	// 3.  Delete API를 활용하여 ExternalName을 삭제
+	log.Info("Attempting to delete ExternalName Service", "name", svcToDelete.Name)
+	if err := r.Delete(ctx, svcToDelete); err != nil {
+		// ExternalName이 이미 삭제되어 없다면 Notfound에러가 뜸
+		if apierrors.IsNotFound(err) {
+			log.Info("Associated ExternalName Service aleady deleted.")
+			return nil
+		}
+		// Notfound에러가 아니라면 재시도를 위해 에러를 반환
+		log.Error(err, "Failed to deleted ExternalName Service during cleanup.")
+		return err
+	}
+	log.Info("Successfully deleted ExternalName Service.")
+	return nil
+}
+
+// 서비스에 "managed" 어노테이션이 있는지 확인
+func (r *ServiceReconciler) isManagedAnnotaion(service *corev1.Service) bool {
+	// 어노테이션이 맵 자체가 없으면 false
+	if service.Annotations == nil {
+		return false
+	}
+	val, ok := service.Annotations[managedAnnotationKey]
+	return ok && val == managedAnnotationValue
+}
+
 func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("service", req.NamespacedName)
 
@@ -66,14 +110,40 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		log.Error(err, "Failed to get Original Service")
 		return ctrl.Result{}, err
 	}
-	// ExternalName Service 이름 결정(LB이름 + Namespace + ext) 예) my-sample-lb-3-default-ext
-	externalNameServiceName := fmt.Sprintf("%s-%s-ext", originalService.Name, originalService.Namespace)
-	externalNameServiceName = r.sanitizeName(externalNameServiceName)
 
 	// 2. Service가 LoadBalancer 타입인지 확인
 	if originalService.Spec.Type != corev1.ServiceTypeLoadBalancer {
 		log.Info("Service is not LoadBalancer type, ignoring.", "type", originalService.Spec.Type)
-		// 만약 이전에 이 서비스에 대해 ExternalName을 만들었다면, 여기서 정리 로직이 필요하지만 단순화 버전에서는 생략
+		return ctrl.Result{}, nil
+	}
+
+	// ExternalName Service 이름 결정(LB이름 + Namespace + ext) 예) my-sample-lb-3-default-ext
+	externalNameServiceName := fmt.Sprintf("%s-%s-ext", originalService.Name, originalService.Namespace)
+	externalNameServiceName = r.sanitizeName(externalNameServiceName)
+
+	// 이 서비스가 Annotaion을 통한 관리 대상인지 확인
+	isManaged := r.isManagedAnnotaion(&originalService)
+
+	// Annotaion을 추가했다가 나중에 제거하게 되면 Operator의 관리대상에서 제외되나 Finalizer는 그대로 남게 되어 영원히 Terminating상태에 빠질 수 있음
+	// 따라서 Annotation이 없는 LB의 경우 Finalizer가 있는지 확인하고, 있다면 ExternalName을 제거 후 Finalizer를 제거해줍니다.
+	hasFinalizer := controllerutil.ContainsFinalizer(&originalService, lbLinkerFinalizer)
+
+	if !isManaged {
+		// 관리 대상이 아닌경우
+		log.Info("Service is not managed by this operator")
+
+		// 이전에 관리 대상이어서 Finalizer가 남아있는 경우
+		if hasFinalizer {
+			log.Info("Annotaion is gone, but finalizer exists. Running Cleanup to remove finalizer")
+
+			// Finalizer만 제거
+			controllerutil.RemoveFinalizer(&originalService, lbLinkerFinalizer)
+			if err := r.Update(ctx, &originalService); err != nil {
+				log.Error(err, "Failed to remove finalizer during hand-off")
+				return ctrl.Result{}, err
+			}
+			log.Info("Finalizer removed.")
+		}
 		return ctrl.Result{}, nil
 	}
 
@@ -81,30 +151,14 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if !originalService.ObjectMeta.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(&originalService, lbLinkerFinalizer) {
 			log.Info("LoadBalancer Service is being deleted, starting cleanup logic.")
-			// Target정리가 필요한 ExternalName은 LB의 이름규칙을 기반으로 확인하기 위해 변수 설정
 
-			// Target을 정리할 ExternalName을 가져온다.
-			svcToDelete := &corev1.Service{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      externalNameServiceName,
-					Namespace: externalTargetsNamespace,
-				},
-			}
-
-			log.Info("Attempting to delete associated ExternalName Service", "name", svcToDelete)
 			// ExternalName 리소스 삭제 작업
-			if err := r.Delete(ctx, svcToDelete); err != nil {
-				// 어차피 삭제되어야할 리소스는 Notfound여야 하니 예외
-				// Notfound가 아닌 에러의 경우만 에러로 간주하여 출력
-				if !apierrors.IsNotFound(err) {
-					log.Error(err, "Failed to delete Externalname Service")
-					return ctrl.Result{}, err
-				}
-				log.Info("ExternalName Service was aleady deleted.")
-
+			if err := r.cleanupExternalNameService(ctx, &originalService, log); err != nil {
+				return ctrl.Result{}, err
 			}
 
-			// ExternalName Target제거 작업이 성공하면 LoadBalancer에서 finalizer 제거
+			// ExternalName 제거 작업이 성공하면 LoadBalancer에서 finalizer 제거
+			log.Info("Cleanup finished. Removing finalizer")
 			controllerutil.RemoveFinalizer(&originalService, lbLinkerFinalizer)
 			if err := r.Update(ctx, &originalService); err != nil {
 				log.Error(err, "Failed to remove finalizer")

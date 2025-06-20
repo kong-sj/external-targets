@@ -121,7 +121,7 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	externalNameServiceName := fmt.Sprintf("%s-%s-ext", originalService.Name, originalService.Namespace)
 	externalNameServiceName = r.sanitizeName(externalNameServiceName)
 
-	// 이 서비스가 Annotaion을 통한 관리 대상인지 확인
+	// 이 서비스가 Annotaion을 통한 관리 대상인지 확인 True or False
 	isManaged := r.isManagedAnnotaion(&originalService)
 
 	// Annotaion을 추가했다가 나중에 제거하게 되면 Operator의 관리대상에서 제외되나 Finalizer는 그대로 남게 되어 영원히 Terminating상태에 빠질 수 있음
@@ -136,9 +136,12 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if hasFinalizer {
 			log.Info("Annotaion is gone, but finalizer exists. Running Cleanup to remove finalizer")
 
+			// LB Finalizer 제거 전 DeepCopy
+			beforePatchFinalizer := originalService.DeepCopy()
+
 			// Finalizer만 제거
 			controllerutil.RemoveFinalizer(&originalService, lbLinkerFinalizer)
-			if err := r.Update(ctx, &originalService); err != nil {
+			if err := r.Patch(ctx, &originalService, client.MergeFrom(beforePatchFinalizer)); err != nil {
 				log.Error(err, "Failed to remove finalizer during hand-off")
 				return ctrl.Result{}, err
 			}
@@ -159,8 +162,13 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 			// ExternalName 제거 작업이 성공하면 LoadBalancer에서 finalizer 제거
 			log.Info("Cleanup finished. Removing finalizer")
+
+			// LB Finalizer 제거 전 Deep Copy
+			beforePatchFinalizer := originalService.DeepCopy()
+
+			// LB Finalizer 제거
 			controllerutil.RemoveFinalizer(&originalService, lbLinkerFinalizer)
-			if err := r.Update(ctx, &originalService); err != nil {
+			if err := r.Patch(ctx, &originalService, client.MergeFrom(beforePatchFinalizer)); err != nil {
 				log.Error(err, "Failed to remove finalizer")
 				return ctrl.Result{}, err
 			}
@@ -172,11 +180,17 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// 3a. Service가 삭제중이 아닐 때: Finalizer가 없다면 추가
 	if !controllerutil.ContainsFinalizer(&originalService, lbLinkerFinalizer) {
 		log.Info("Adding Finalizer for the Loadbalacner Service.")
+
+		// LB Finalizer 추가 전 Deep Copy
+		beforePatchFinalizer := originalService.DeepCopy()
+
+		// LB Finalzier 추가
 		controllerutil.AddFinalizer(&originalService, lbLinkerFinalizer)
-		if err := r.Update(ctx, &originalService); err != nil {
+		if err := r.Patch(ctx, &originalService, client.MergeFrom(beforePatchFinalizer)); err != nil {
 			log.Error(err, "Failed to add finalizer")
 			return ctrl.Result{}, err
 		}
+		log.Info("Sunccessfully finalizer added")
 	}
 
 	// 4. LoadBalancer의 외부 IP 또는 Hostname 정보 확인
